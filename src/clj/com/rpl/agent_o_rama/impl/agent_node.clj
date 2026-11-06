@@ -24,6 +24,7 @@
    [com.rpl.agentorama.impl
     AgentDeclaredObjectsTaskGlobal
     AgentNodeExecutorTaskGlobal
+    NodeAttempt
     RamaClientsTaskGlobal]
    [com.rpl.agent_o_rama.impl.types
     Node]
@@ -74,7 +75,8 @@
   (release-acquired-objects! [this])
   (get-streaming-recorder [this])
   (get-declared-objects [this])
-  (get-agent-invoke [this]))
+  (get-agent-invoke [this])
+  (get-attempt [this]))
 
 (defprotocol StreamingRecorderInternal
   (waitFinish [this]))
@@ -559,6 +561,10 @@
         }))
     )))
 
+(defn log-node-error
+  [t msg data]
+  (cljlogging/error t msg data))
+
 (defn mk-agent-node
   [agent-name agent-graph agent-task-id agent-id execution-context curr-node invoke-id retry-num
    store-info ^RamaClientsTaskGlobal rama-clients]
@@ -588,6 +594,12 @@
         declared-objects-tg (po/agent-declared-objects-task-global)
 
         fetcher             (mk-fetcher)
+
+        attempt             (NodeAttempt. agent-name
+                                          (long agent-task-id)
+                                          agent-id
+                                          invoke-id
+                                          (long retry-num))
 
         ^AgentNodeExecutorTaskGlobal node-exec
         (po/agent-node-executor-task-global)
@@ -703,8 +715,27 @@
                 finish-time-millis
                 (aor-types/nested-op-type->clj type)
                 (into {} info))))
+     (isInvalidated [this]
+       (.isInvalidated attempt))
+     (getInvalidationCause [this]
+       (.getInvalidationCause attempt))
+     (onInvalidated [this callback]
+       (.onInvalidated attempt
+                       (fn []
+                         (try
+                           (.run callback)
+                           (catch Throwable t
+                             (log-node-error t
+                                             "Error in on-invalidated callback"
+                                             {:node      curr-node
+                                              :invoke-id invoke-id}))))))
      (getHumanInput
        [this prompt]
+       ;; no answer can come, and the interrupt that would have ended the wait
+       ;; may already have been caught
+       (when (.isInvalidated attempt)
+         (throw (h/ex-info "Asked for human input after the node was invalidated"
+                           {:node curr-node :prompt prompt})))
        (let [start-time-millis (h/current-time-millis)
              request (aor-types/->valid-NodeHumanInputRequest
                       agent-task-id
@@ -715,7 +746,7 @@
                       prompt
                       (h/random-uuid-str))
              cf      (CompletableFuture.)
-             _ (.putHumanFuture node-exec invoke-id (long retry-num) request cf)
+             _ (.putHumanFuture node-exec attempt request cf)
              _ (foreign-append! human-depot
                                 (aor-types/->valid-AttemptHumanInputRequest
                                  request
@@ -739,6 +770,7 @@
      (release-acquired-objects! [this]
        (release-acquired-objects! fetcher))
      (get-agent-invoke [this] (aor-types/->AgentInvokeImpl agent-task-id agent-id))
+     (get-attempt [this] attempt)
      (agent-node-state [this]
        {:emits      @emits-vol
         :result     @result-vol
@@ -746,21 +778,12 @@
        }))))
 
 (defn submit-virtual-task!
-  "Runs afn on a virtual thread. With an invoke id, the execution is tracked as
-  that node's run for attempt retry-num. The 2-arity is for untracked work (nil
-  invoke id)."
-  ([invoke-id afn]
-   (when (some? invoke-id)
-     (throw (h/ex-info "A tracked task needs a retry num" {:invoke-id invoke-id})))
-   (submit-virtual-task! nil -1 afn))
-  ([invoke-id retry-num afn]
-   (let [^AgentNodeExecutorTaskGlobal node-exec
-         (po/agent-node-executor-task-global)]
-     (.submitTask node-exec invoke-id (long retry-num) afn))))
-
-(defn log-node-error
-  [t msg data]
-  (cljlogging/error t msg data))
+  "Runs afn on a virtual thread. With an attempt, the execution is tracked as
+  that node's run. A nil attempt is for untracked work."
+  [^NodeAttempt attempt ^clojure.lang.AFn afn]
+  (let [^AgentNodeExecutorTaskGlobal node-exec
+        (po/agent-node-executor-task-global)]
+    (.submitTask node-exec attempt afn)))
 
 (def AGENT-NODE-CONTEXT (ThreadLocal.))
 
@@ -1091,21 +1114,27 @@
             fork-context)
            :append-ack))
         (catch Throwable t
-          (log-node-error t
-                          "Error during agent node execution"
-                          {:node      node-name
-                           :invoke-id invoke-id})
-          (foreign-append!
-           depot
-           (aor-types/->valid-NodeFailure
-            task-id
-            invoke-id
-            retry-num
-            (h/throwable->str t)
-            (-> agent-node
-                agent-node-state
-                :nested-ops))
-           :append-ack)
+          ;; the signal decides and not the exception's type: AoR wraps
+          ;; InterruptedException in places, and a user's own one with no signal
+          ;; fails the node
+          (if (.isInvalidated agent-node)
+            (Thread/interrupted)
+            (do
+              (log-node-error t
+                              "Error during agent node execution"
+                              {:node      node-name
+                               :invoke-id invoke-id})
+              (foreign-append!
+               depot
+               (aor-types/->valid-NodeFailure
+                task-id
+                invoke-id
+                retry-num
+                (h/throwable->str t)
+                (-> agent-node
+                    agent-node-state
+                    :nested-ops))
+               :append-ack)))
           (throw t))
         (finally
           (release-acquired-objects! agent-node)))
@@ -1174,8 +1203,7 @@
                 aor-types/ACQUIRE-OBJECT-TIMEOUT-MILLIS-CONFIG
                 :> *acquire-timeout-millis)
    (submit-virtual-task!
-    *invoke-id
-    *retry-num
+    (get-attempt *agent-node)
     (node-event *agent-name
                 *task-id
                 *invoke-id

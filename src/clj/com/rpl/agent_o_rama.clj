@@ -36,6 +36,7 @@
     AgentStreamByInvoke
     CreateEvaluatorOptions
     HumanInputRequest
+    InvalidationCause
     MultiAgg$Impl
     UpdateMode]
    [com.rpl.agentorama.impl
@@ -1040,6 +1041,43 @@ Example:\n
   [^AgentNode agent-node prompt]
   (.getHumanInput agent-node prompt))
 
+
+(defn invalidated?
+  "Whether this execution of the node has been invalidated, because the run is being retried or was cancelled. Its emits, result, streaming chunks and store writes are dropped from then on, so it should stop. Effects AoR doesn't manage aren't undone or prevented, such as external calls or appends to your own depots.\n
+\n
+The node's thread is also interrupted, right after this becomes true. Check this for work that doesn't respond to interrupts, or for code that catches them.\n
+\n
+Args:\n
+  - agent-node - agent node instance from the current node function
+\n
+Returns:\n
+  - Boolean - True if this execution has been invalidated"
+  [^AgentNode agent-node]
+  (.isInvalidated agent-node))
+
+(defn invalidation-cause
+  "Gets why this execution of the node was invalidated.\n
+\n
+Args:\n
+  - agent-node - agent node instance from the current node function
+\n
+Returns:\n
+  - Keyword - :retry or :cancel, or nil if it hasn't been invalidated"
+  [^AgentNode agent-node]
+  (let [cause (.getInvalidationCause agent-node)]
+    (cond
+      (nil? cause) nil
+      (= cause InvalidationCause/RETRY) :retry
+      (= cause InvalidationCause/CANCEL) :cancel)))
+
+(defn on-invalidated
+  "Registers a callback for when this execution of the node is invalidated, to stop work that an interrupt doesn't reach, such as work running on other threads. The callback runs once on its own virtual thread, right away if already invalidated, and possibly after the node has returned. It isn't ordered with the interrupt.\n
+\n
+Args:\n
+  - agent-node - agent node instance from the current node function
+  - callback - Function of no arguments"
+  [^AgentNode agent-node ^Runnable callback]
+  (.onInvalidated agent-node callback))
 
 (defn get-metadata
   "Gets metadata associated with an agent invocation. Can be called from an agent client to get the metadata for that invoke, or can be called from within any agent node function.\n

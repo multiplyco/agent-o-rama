@@ -312,6 +312,9 @@
                (.getMirrorQueryTopologyClient agent-node module-name name))
              (streamChunk [this chunk])
              (recordNestedOp [this nestedOpType startTimeMillis finishTimeMillis info])
+             (isInvalidated [this] (.isInvalidated agent-node))
+             (getInvalidationCause [this] (.getInvalidationCause agent-node))
+             (onInvalidated [this callback] (.onInvalidated agent-node callback))
              (getHumanInput [this prompt]
                (.getHumanInput agent-node prompt)))]
         (try

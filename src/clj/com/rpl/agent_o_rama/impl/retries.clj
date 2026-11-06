@@ -11,6 +11,8 @@
    [com.rpl.rama.aggs :as aggs]
    [com.rpl.rama.ops :as ops])
   (:import
+   [com.rpl.agentorama
+    InvalidationCause]
    [com.rpl.agentorama.impl
     AgentNodeExecutorTaskGlobal]))
 
@@ -116,6 +118,17 @@
   [agent-task-id agent-id retry-num]
   (hook:stall-detected agent-task-id agent-id retry-num))
 
+(defn interrupt-attempts-below!
+  [agent-name agent-task-id agent-id below-retry-num]
+  (let [^AgentNodeExecutorTaskGlobal node-exec
+        (po/agent-node-executor-task-global)]
+    (.interruptAttempts node-exec
+                        agent-name
+                        (long agent-task-id)
+                        agent-id
+                        (long below-retry-num)
+                        InvalidationCause/RETRY)))
+
 (defn log-warn
   [msg data]
   (cljlogging/warn msg data))
@@ -159,6 +172,22 @@
       (hook:checker-finished*)
 
      (source> failure-depot-sym :> %microbatch)
+      ;; - the old attempt is replaced, so what its running nodes do is dropped as
+      ;; stale from here on. Stop them instead of wasting that work
+      ;; - :valid-invokes was committed in the previous microbatch, so no new node
+      ;; of the old attempt can start after this reaches its task
+      ;; - before the batch below, so this can't race the new attempt's resubmit,
+      ;; and separate since |all there would multiply the appends. A replay is
+      ;; harmless since this only reaches attempts below the next one
+      (<<batch
+        (|all)
+        (local-select> [:pending-retries ALL]
+                       agent-mb-shared-pstate-sym
+                       {:allow-yield? true}
+                       :> [*agent-task-id *agent-id *retry-num])
+        (inc *retry-num :> *next-retry-num)
+        (|all)
+        (interrupt-attempts-below! agent-name *agent-task-id *agent-id *next-retry-num))
       ;; this needs to happen here so that the updates to valid invokes
       ;; in the previous microbatch have been committed
       (<<batch

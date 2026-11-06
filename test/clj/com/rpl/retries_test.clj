@@ -24,9 +24,11 @@
   (:import
    [com.rpl.agentorama
     AgentFailedException
-    AgentInvoke]
+    AgentInvoke
+    InvalidationCause]
    [com.rpl.agentorama.impl
-    AgentNodeExecutorTaskGlobal]
+    AgentNodeExecutorTaskGlobal
+    NodeAttempt]
    [com.rpl.rama.helpers
     TopologyUtils]
    [dev.langchain4j.data.message
@@ -42,7 +44,8 @@
     FinishReason
     TokenUsage]
    [java.util.concurrent
-    CompletableFuture]))
+    CompletableFuture
+    Semaphore]))
 
 (def SEM)
 (def SEM2)
@@ -55,6 +58,13 @@
 (defn get-executing-node-ids
   [^AgentNodeExecutorTaskGlobal node-exec]
   (.getRunningInvokeIds node-exec))
+
+;; for a stale attempt's node that carries on: a retry interrupts it, and a node
+;; can catch that
+(defn acquire-ignoring-interrupt
+  [^Semaphore sem]
+  (.acquireUninterruptibly sem)
+  (Thread/interrupted))
 
 (deframafn emits-dropper
   [*atom *filters-atom]
@@ -517,6 +527,10 @@
        anode/log-node-error (fn [& args])
 
        i/SUBSTITUTE-TICK-DEPOTS true
+
+       ;; stale nodes that carry on, as across a leader change, where the
+       ;; interrupt can't reach them
+       retries/interrupt-attempts-below! (fn [& args])
 
        apart/hook:filtered-event (fn [& args] (swap! EVENTS-ATOM conj :filter))
 
@@ -1497,9 +1511,12 @@
                   "slow"
                   nil
                   (fn [agent-node]
-                    ;; first run (attempt 0) waits on SEM, later runs on SEM2
+                    ;; first run (attempt 0) ignores the retry's interrupt and
+                    ;; waits on SEM, later runs on SEM2
                     (let [n (swap! SLOW-INVOKES-ATOM inc)]
-                      (h/acquire-semaphore (if (= 1 n) SEM SEM2) 1)
+                      (if (= 1 n)
+                        (acquire-ignoring-interrupt SEM)
+                        (h/acquire-semaphore SEM2 1))
                       (aor/result! agent-node n)))))
                (aor/define-agents! topology)
                (<<query-topology topologies
@@ -1567,24 +1584,21 @@
         )))))
 
 (def ASK-INVOKES-ATOM)
-(def STALE-THREAD-ATOM)
-(def FILTERED-ATOM)
+(def STALE-ASK-ATOM)
 
-;; Same reuse of the node invoke id: if the invalidated attempt's run asks for
-;; human input after the current attempt's run did, it must not hide the
-;; current attempt's request, so the response to it still reaches the current
-;; attempt.
+;; Same reuse of the node invoke id: if the invalidated attempt's run ignores the
+;; interrupt and asks for human input after the current attempt's run did, it
+;; can't wait for an answer and must not hide the current attempt's request, so
+;; the response to it still reaches the current attempt.
 (deftest stale-attempt-human-input-test
   (with-redefs
     [SEM (h/mk-semaphore 0)
      ASK-INVOKES-ATOM (atom 0)
-     STALE-THREAD-ATOM (atom nil)
-     FILTERED-ATOM (atom 0)
+     STALE-ASK-ATOM (atom nil)
 
      i/SUBSTITUTE-TICK-DEPOTS true
      aor-types/get-config (max-retries-override 5)
-     anode/log-node-error (fn [& args])
-     apart/hook:filtered-event (fn [& args] (swap! FILTERED-ATOM inc))]
+     anode/log-node-error (fn [& args])]
     (with-open [ipc (rtest/create-ipc)]
       (letlocals
        (bind module
@@ -1606,9 +1620,12 @@
                   (if (= 1 (swap! ASK-INVOKES-ATOM inc))
                     ;; attempt 0: asks only once released, after attempt 1 asked
                     (do
-                      (h/acquire-semaphore SEM 1)
-                      (reset! STALE-THREAD-ATOM (Thread/currentThread))
-                      (aor/get-human-input agent-node "stale"))
+                      (acquire-ignoring-interrupt SEM)
+                      (try
+                        (aor/get-human-input agent-node "stale")
+                        (catch Throwable t
+                          (reset! STALE-ASK-ATOM (ex-message t))
+                          (throw t))))
                     (aor/result! agent-node
                                  (aor/get-human-input agent-node "current"))))))
              (aor/define-agents! topology))))
@@ -1633,10 +1650,10 @@
                                                   0))
        (is (condition-attained? (= #{"current"} (prompts))))
 
-       ;; now attempt 0's run asks too; its request is dropped as stale
-       (bind filtered-before @FILTERED-ATOM)
+       ;; now attempt 0's run asks too, and isn't left waiting
        (h/release-semaphore SEM 1)
-       (is (condition-attained? (> @FILTERED-ATOM filtered-before)))
+       (is (condition-attained? (some? @STALE-ASK-ATOM)))
+       (is (str/includes? @STALE-ASK-ATOM "invalidated"))
        (is (= #{"current"} (prompts)))
 
        (aor/provide-human-input foo
@@ -1646,9 +1663,6 @@
        (is (condition-attained? (aor/agent-invoke-complete? foo inv)))
        (when (aor/agent-invoke-complete? foo inv)
          (is (= "answer" (aor/agent-result foo inv))))
-
-       ;; attempt 0's thread waits for input that can't arrive
-       (some-> ^Thread @STALE-THREAD-ATOM .interrupt)
       ))))
 
 ;; A :continue retry is progress. Until the first replayed node's emits refresh
@@ -1982,4 +1996,423 @@
        ;; attempt 0's thread waits for input that can't arrive
        (doseq [^Thread t @ASKING-THREADS-ATOM]
          (.interrupt t))
+      ))))
+
+(def STARTED-ATOM)
+(def INTERRUPTED-ATOM)
+(def CALLBACKS-ATOM)
+(def INITIAL-SIGNAL-ATOM)
+
+;; A retry replaces the attempt, so the old attempt's running nodes would only
+;; be wasting work: their output is dropped as stale.
+(deftest retry-interrupts-old-attempt-test
+  (let [logged-atom   (atom [])
+        filtered-atom (atom 0)]
+    (with-redefs
+      [SEM (h/mk-semaphore 0)
+       STARTED-ATOM (atom {})
+       INTERRUPTED-ATOM (atom [])
+       CALLBACKS-ATOM (atom [])
+       INITIAL-SIGNAL-ATOM (atom [])
+
+       i/SUBSTITUTE-TICK-DEPOTS true
+       aor-types/get-config (max-retries-override 5)
+       anode/log-node-error (fn [_ msg data] (swap! logged-atom conj [msg data]))
+       apart/hook:filtered-event (fn [& args] (swap! filtered-atom inc))]
+      (with-open [ipc (rtest/create-ipc)]
+        (letlocals
+         (bind module
+           (module
+             [setup topologies]
+             (let [topology (aor/agent-topology setup topologies)]
+               (->
+                 topology
+                 (aor/new-agent "foo")
+                 (aor/node
+                  "start"
+                  "slow"
+                  (fn [agent-node run-name]
+                    (aor/emit! agent-node "slow" run-name)))
+                 (aor/node
+                  "slow"
+                  nil
+                  (fn [agent-node run-name]
+                    (swap! INITIAL-SIGNAL-ATOM
+                           conj
+                           [(aor/invalidated? agent-node)
+                            (aor/invalidation-cause agent-node)])
+                    (aor/on-invalidated
+                     agent-node
+                     (fn []
+                       (swap! CALLBACKS-ATOM conj [run-name (aor/invalidation-cause agent-node)])))
+                    (let [n (-> STARTED-ATOM
+                                (swap! update run-name (fnil inc 0))
+                                (get run-name))]
+                      (when (= 1 n)
+                        (try
+                          (h/acquire-semaphore SEM 1)
+                          (catch InterruptedException e
+                            ;; the signal is visible by the time of the interrupt
+                            (swap! INTERRUPTED-ATOM
+                                   conj
+                                   [run-name
+                                    (aor/invalidated? agent-node)
+                                    (aor/invalidation-cause agent-node)])
+                            (throw e))))
+                      (aor/result! agent-node [run-name n])))))
+               (aor/define-agents! topology))))
+         (launch-module-without-eval-agent! ipc module {:tasks 4 :threads 2})
+         (bind module-name (get-module-name module))
+         (bind failures-depot
+           (foreign-depot ipc
+                          module-name
+                          (po/agent-failures-depot-name "foo")))
+         (bind root-pstate
+           (foreign-pstate ipc
+                           module-name
+                           (po/agent-root-task-global-name "foo")))
+         (bind agent-manager (aor/agent-manager ipc module-name))
+         (bind foo (aor/agent-client agent-manager "foo"))
+
+         (bind retried (aor/agent-initiate foo "retried"))
+         (bind other (aor/agent-initiate foo "other"))
+         (is (condition-attained? (= {"retried" 1 "other" 1} @STARTED-ATOM)))
+         (is (= [[false nil] [false nil]] @INITIAL-SIGNAL-ATOM))
+
+         (foreign-append! failures-depot
+                          (aor-types/->AgentFailure (.getTaskId retried)
+                                                    (.getAgentInvokeId retried)
+                                                    0))
+         (is (condition-attained? (= [["retried" true :retry]] @INTERRUPTED-ATOM)))
+         (is (condition-attained? (= [["retried" :retry]] @CALLBACKS-ATOM)))
+
+         ;; the new attempt runs, and isn't invalidated
+         (is (condition-attained? (= 2 (get @STARTED-ATOM "retried"))))
+         (is (condition-attained? (aor/agent-invoke-complete? foo retried)))
+         (when (aor/agent-invoke-complete? foo retried)
+           (is (= ["retried" 2] (aor/agent-result foo retried))))
+
+         ;; another run of the agent is left alone
+         (h/release-semaphore SEM 1)
+         (is (condition-attained? (aor/agent-invoke-complete? foo other)))
+         (when (aor/agent-invoke-complete? foo other)
+           (is (= ["other" 1] (aor/agent-result foo other))))
+         (is (= [["retried" true :retry]] @INTERRUPTED-ATOM))
+         (is (= [["retried" :retry]] @CALLBACKS-ATOM))
+
+         ;; the interrupted node didn't report a failure. One from the old attempt
+         ;; would be filtered as stale.
+         (is (= [] @logged-atom))
+         (is (= 0 @filtered-atom))
+         (is (empty? (foreign-select-one [(keypath (.getAgentInvokeId retried)) :exception-summaries]
+                                         root-pstate
+                                         {:pkey (.getTaskId retried)})))
+        )))))
+
+;; An interrupt with no invalidation is the node's own failure.
+(deftest users-interrupted-exception-fails-node-test
+  (let [logged-atom (atom [])]
+    (with-redefs
+      [aor-types/get-config (max-retries-override 0)
+       anode/log-node-error (fn [_ msg data] (swap! logged-atom conj msg))]
+      (with-open [ipc (rtest/create-ipc)]
+        (letlocals
+         (bind module
+           (module
+             [setup topologies]
+             (let [topology (aor/agent-topology setup topologies)]
+               (->
+                 topology
+                 (aor/new-agent "foo")
+                 (aor/node
+                  "start"
+                  nil
+                  (fn [agent-node]
+                    (throw (InterruptedException. "the node's own")))))
+               (aor/define-agents! topology))))
+         (launch-module-without-eval-agent! ipc module {:tasks 2 :threads 1})
+         (bind module-name (get-module-name module))
+         (bind root-pstate
+           (foreign-pstate ipc
+                           module-name
+                           (po/agent-root-task-global-name "foo")))
+         (bind agent-manager (aor/agent-manager ipc module-name))
+         (bind foo (aor/agent-client agent-manager "foo"))
+
+         (bind inv (aor/agent-initiate foo))
+         (is (thrown? Exception (aor/agent-result foo inv)))
+         (is (= ["Error during agent node execution"] @logged-atom))
+         (is (= 1 (count (foreign-select-one [(keypath (.getAgentInvokeId inv)) :exception-summaries]
+                                             root-pstate
+                                             {:pkey (.getTaskId inv)}))))
+        )))))
+
+(def ASK-RESULTS-ATOM)
+
+;; The wait for human input is interruptible, so a retry ends it, and the next
+;; attempt's wait under the same invoke id isn't affected.
+(deftest retry-unblocks-human-input-test
+  (with-redefs
+    [ASK-RESULTS-ATOM (atom [])
+
+     i/SUBSTITUTE-TICK-DEPOTS true
+     aor-types/get-config (max-retries-override 5)
+     anode/log-node-error (fn [& args])]
+    (with-open [ipc (rtest/create-ipc)]
+      (letlocals
+       (bind module
+         (module
+           [setup topologies]
+           (let [topology (aor/agent-topology setup topologies)]
+             (->
+               topology
+               (aor/new-agent "foo")
+               (aor/node
+                "start"
+                "ask"
+                (fn [agent-node]
+                  (aor/emit! agent-node "ask")))
+               (aor/node
+                "ask"
+                nil
+                (fn [agent-node]
+                  (if (empty? @ASK-RESULTS-ATOM)
+                    (try
+                      (aor/get-human-input agent-node "first")
+                      (catch Throwable t
+                        (swap! ASK-RESULTS-ATOM conj (aor/invalidation-cause agent-node))
+                        (throw t)))
+                    (aor/result! agent-node (aor/get-human-input agent-node "second"))))))
+             (aor/define-agents! topology))))
+       (launch-module-without-eval-agent! ipc module {:tasks 4 :threads 2})
+       (bind module-name (get-module-name module))
+       (bind failures-depot
+         (foreign-depot ipc
+                        module-name
+                        (po/agent-failures-depot-name "foo")))
+       (bind agent-manager (aor/agent-manager ipc module-name))
+       (bind foo (aor/agent-client agent-manager "foo"))
+
+       (bind inv (aor/agent-initiate foo))
+       (bind pending #(aor/pending-human-inputs foo inv))
+       (is (condition-attained? (= ["first"] (map :prompt (pending)))))
+
+       (foreign-append! failures-depot
+                        (aor-types/->AgentFailure (.getTaskId inv)
+                                                  (.getAgentInvokeId inv)
+                                                  0))
+       (is (condition-attained? (= [:retry] @ASK-RESULTS-ATOM)))
+       (is (condition-attained? (= ["second"] (map :prompt (pending)))))
+
+       (when (= ["second"] (map :prompt (pending)))
+         (aor/provide-human-input foo (first (pending)) "answer")
+         (is (= "answer" (aor/agent-result foo inv))))
+      ))))
+
+;; A node's thread returns right after NodeComplete's :append-ack, before the
+;; stream topology processes it. Until then the node record has no finish time,
+;; so a node no longer tracked would be taken for a stalled one.
+(deftest returned-thread-stays-tracked-until-complete-test
+  (let [checks-atom (atom 0)
+        stalls-atom (atom 0)
+        returned    (promise)
+        node-event  anode/node-event]
+    (with-redefs
+      [i/SUBSTITUTE-TICK-DEPOTS true
+       retries/checker-threshold-millis short-checker-threshold-millis
+       aor-types/get-config (max-retries-override 5)
+       retries/hook:checker-finished (fn [] (swap! checks-atom inc))
+       retries/hook:stall-detected (fn [& args] (swap! stalls-atom inc))
+       ;; "slow" returns as if its NodeComplete were still to be processed
+       anode/node-event
+       (fn [agent-name task-id invoke-id retry-num node-name & args]
+         (if (= "slow" node-name)
+           (fn [] (deliver returned invoke-id))
+           (apply node-event agent-name task-id invoke-id retry-num node-name args)))]
+      (with-open [ipc (rtest/create-ipc)
+                  _ (TopologyUtils/startSimTime)]
+        (letlocals
+         (bind module
+           (module
+             [setup topologies]
+             (let [topology  (aor/agent-topology setup topologies)
+                   node-exec (symbol (po/agent-node-executor-name))]
+               (->
+                 topology
+                 (aor/new-agent "foo")
+                 (aor/node
+                  "start"
+                  "slow"
+                  (fn [agent-node]
+                    (aor/emit! agent-node "slow")))
+                 (aor/node "slow" nil (fn [agent-node])))
+               (aor/define-agents! topology)
+               (<<query-topology topologies
+                 "executing"
+                 [:> *res]
+                 (|all)
+                 (get-executing-node-ids node-exec :> *invoke-ids)
+                 (ops/explode *invoke-ids :> *invoke-id)
+                 (|origin)
+                 (aggs/+set-agg *invoke-id :> *res)))))
+         (launch-module-without-eval-agent! ipc module {:tasks 4 :threads 2})
+         (bind module-name (get-module-name module))
+         (bind check-depot
+           (foreign-depot ipc
+                          module-name
+                          (po/agent-check-tick-depot-name "foo")))
+         (bind agent-manager (aor/agent-manager ipc module-name))
+         (bind foo (aor/agent-client agent-manager "foo"))
+
+         (aor/agent-initiate foo)
+         (bind invoke-id (deref returned 30000 nil))
+         (is (some? invoke-id))
+         (is (= #{invoke-id} (foreign-invoke-query (foreign-query ipc module-name "executing"))))
+
+         (TopologyUtils/advanceSimTime 1000)
+         (foreign-append! check-depot nil)
+         (is (condition-attained? (= 1 @checks-atom)))
+         (is (= 0 @stalls-atom))
+        )))))
+
+(def SUBMIT-STARTED-ATOM)
+
+(defn submit-and-interrupt!
+  "Interrupts tasks right after submitting them, so some haven't started."
+  [n]
+  (let [^AgentNodeExecutorTaskGlobal node-exec (po/agent-node-executor-task-global)
+        agent-id (h/random-uuid7)
+        wait (Semaphore. 0)
+        interrupt! (fn [agent-name task-id below-retry-num]
+                     (.interruptAttempts node-exec
+                                         agent-name
+                                         (long task-id)
+                                         agent-id
+                                         (long below-retry-num)
+                                         InvalidationCause/RETRY))
+        submit! (fn [agent-name task-id retry-num]
+                  (let [attempt (NodeAttempt. agent-name
+                                              (long task-id)
+                                              agent-id
+                                              (h/random-uuid7)
+                                              (long retry-num))]
+                    (anode/submit-virtual-task!
+                     attempt
+                     (fn []
+                       (swap! SUBMIT-STARTED-ATOM inc)
+                       (.acquire wait)))
+                    attempt))
+        interrupted (doall
+                     (for [_ (range n)]
+                       (let [attempt (submit! "foo" 0 0)]
+                         (interrupt! "foo" 0 1)
+                         attempt)))
+        ;; none of these are below the retry num, or in the run
+        spared [(submit! "foo" 0 1) (submit! "bar" 0 0) (submit! "foo" 1 0)]
+        _ (interrupt! "foo" 0 1)
+        res {:all-invalidated? (every? #(.isInvalidated ^NodeAttempt %) interrupted)
+             :spared-invalidated (count (filter #(.isInvalidated ^NodeAttempt %) spared))
+             :tracked (count (.getRunningInvokeIds node-exec))}]
+    (interrupt! "foo" 0 2)
+    (interrupt! "bar" 0 1)
+    (interrupt! "foo" 1 1)
+    (assoc res :tracked-at-end (count (.getRunningInvokeIds node-exec)))))
+
+;; cancel(true) on a task that hasn't started means its body never runs, so
+;; nothing but the interrupt can remove its tracking.
+(deftest interrupt-removes-tracking-test
+  (with-redefs [SUBMIT-STARTED-ATOM (atom 0)]
+    (with-open [ipc (rtest/create-ipc)]
+      (letlocals
+       (bind module
+         (module
+           [setup topologies]
+           (let [topology (aor/agent-topology setup topologies)]
+             (-> topology
+                 (aor/new-agent "foo")
+                 (aor/node "start" nil (fn [agent-node])))
+             (aor/define-agents! topology)
+             (<<query-topology topologies
+               "submit-and-interrupt"
+               [:> *res]
+               (|direct 0)
+               (submit-and-interrupt! 200 :> *res)
+               (|origin)))))
+       (launch-module-without-eval-agent! ipc module {:tasks 1 :threads 1})
+       (bind res
+         (foreign-invoke-query (foreign-query ipc (get-module-name module) "submit-and-interrupt")))
+       (is (= {:all-invalidated? true :spared-invalidated 0 :tracked 3 :tracked-at-end 0} res))
+      ))))
+
+(def OBJECT-BUILDS-ATOM)
+
+(defn build-blocking-first!
+  [name]
+  (let [builds (-> OBJECT-BUILDS-ATOM
+                   (swap! update name (fnil inc 0))
+                   (get name))]
+    (when (= 1 builds)
+      (.acquire (Semaphore. 0)))
+    [name builds]))
+
+;; A retry's interrupt can land while the node is building an agent object. That
+;; must not cost the pool its permit, or poison a shared object for later runs.
+(deftest retry-interrupting-object-build-test
+  (with-redefs
+    [OBJECT-BUILDS-ATOM (atom {})
+
+     i/SUBSTITUTE-TICK-DEPOTS true
+     aor-types/get-config
+     (let [prev (max-retries-override 5)]
+       (fn [m config]
+         (if (= (:name config) (:name aor-types/ACQUIRE-OBJECT-TIMEOUT-MILLIS-CONFIG))
+           2000
+           (prev m config))))
+     anode/log-node-error (fn [& args])]
+    (with-open [ipc (rtest/create-ipc)]
+      (letlocals
+       (bind module
+         (module
+           [setup topologies]
+           (let [topology (aor/agent-topology setup topologies)]
+             (aor/declare-agent-object-builder
+              topology
+              "pooled"
+              (fn [_] (build-blocking-first! "pooled"))
+              {:worker-object-limit 1})
+             (aor/declare-agent-object-builder
+              topology
+              "shared"
+              (fn [_] (build-blocking-first! "shared"))
+              {:thread-safe? true})
+             (->
+               topology
+               (aor/new-agent "foo")
+               (aor/node
+                "start"
+                nil
+                (fn [agent-node object-name]
+                  (aor/result! agent-node (aor/get-agent-object agent-node object-name)))))
+             (aor/define-agents! topology))))
+       (launch-module-without-eval-agent! ipc module {:tasks 4 :threads 2})
+       (bind module-name (get-module-name module))
+       (bind failures-depot
+         (foreign-depot ipc
+                        module-name
+                        (po/agent-failures-depot-name "foo")))
+       (bind agent-manager (aor/agent-manager ipc module-name))
+       (bind foo (aor/agent-client agent-manager "foo"))
+
+       (doseq [object-name ["pooled" "shared"]]
+         (let [inv (aor/agent-initiate foo object-name)]
+           (is (condition-attained? (= 1 (get @OBJECT-BUILDS-ATOM object-name))))
+           (foreign-append! failures-depot
+                            (aor-types/->AgentFailure (.getTaskId inv)
+                                                      (.getAgentInvokeId inv)
+                                                      0))
+           (is (condition-attained? (aor/agent-invoke-complete? foo inv)))
+           (when (aor/agent-invoke-complete? foo inv)
+             (is (= [object-name 2] (aor/agent-result foo inv))))
+           ;; a later, independent run
+           (is (= [object-name 2] (aor/agent-invoke foo object-name)))))
       ))))

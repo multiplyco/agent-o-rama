@@ -143,6 +143,39 @@ public interface AgentNode extends AgentObjectFetcher, IFetchAgentClient {
   String getHumanInput(String prompt);
 
   /**
+   * Whether this execution of the node has been invalidated, because the run is
+   * being retried or was cancelled. Its emits, result, streaming chunks and store
+   * writes are dropped from then on, so it should stop. Effects AoR doesn't manage
+   * aren't undone or prevented, such as external calls or appends to your own
+   * depots.
+   *
+   * The node's thread is also interrupted, right after this becomes true. Check
+   * this for work that doesn't respond to interrupts, or for code that catches
+   * them.
+   *
+   * @return true if this execution has been invalidated
+   */
+  boolean isInvalidated();
+
+  /**
+   * Gets why this execution of the node was invalidated.
+   *
+   * @return the cause, or null if it hasn't been invalidated
+   */
+  InvalidationCause getInvalidationCause();
+
+  /**
+   * Registers a callback for when this execution of the node is invalidated, to
+   * stop work that an interrupt doesn't reach, such as work running on other
+   * threads. The callback runs once on its own virtual thread, right away if
+   * already invalidated, and possibly after the node has returned. It isn't
+   * ordered with the interrupt.
+   *
+   * @param callback the callback to run
+   */
+  void onInvalidated(Runnable callback);
+
+  /**
    * Gets metadata associated with this agent execution.
    *
    * @return map of metadata key-value pairs
