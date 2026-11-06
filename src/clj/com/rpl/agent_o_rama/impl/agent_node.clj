@@ -1159,6 +1159,7 @@
           {:agent-id          *agent-id
            :agent-task-id     *agent-task-id
            :node              *next-node
+           :status            :running
            :metadata          (get *execution-context :metadata)
            :source            (get *execution-context :source)
            :start-time-millis *start-time-millis
@@ -1202,10 +1203,18 @@
   [*agent-name *agent-task-id *agent-id *node *invoke-id *retry-num *afn *info]
   (<<with-substitutions
    [$$root (po/agent-root-task-global *agent-name)
+    $$nodes (po/agent-node-task-global *agent-name)
     *failure-depot (po/agent-failures-depot-task-global *agent-name)]
    (invoke-or-error *afn *info :> *res)
    (<<if (and> (map? *res) (contains? *res ::error))
      (h/throwable->str (get *res ::error) :> *s)
+     ;; these run on the task thread, so no NodeFailure records this. A new
+     ;; aggregation failing to initialize has no record yet.
+     (local-transform>
+      [(must *invoke-id)
+       (multi-path [:status (termval :failed)]
+                   [:exceptions AFTER-ELEM (termval *s)])]
+      $$nodes)
      (|direct *agent-task-id)
      (local-transform>
       [(must *agent-id)

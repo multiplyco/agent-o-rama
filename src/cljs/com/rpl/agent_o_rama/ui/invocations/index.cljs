@@ -30,6 +30,9 @@
     (= status :failure)
     ($ :span.px-2.py-1.bg-red-100.text-red-800.rounded-full.text-xs.font-medium "Failed")
 
+    (= status :cancelled)
+    ($ :span.px-2.py-1.bg-gray-200.text-gray-800.rounded-full.text-xs.font-medium "Cancelled")
+
     :else
     ($ :span.px-2.py-1.bg-green-100.text-green-800.rounded-full.text-xs.font-medium "Success")))
 

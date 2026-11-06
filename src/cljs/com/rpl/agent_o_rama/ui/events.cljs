@@ -55,16 +55,21 @@
 
 (defn graph-has-in-progress-nodes?
   [db invoke-id]
-  (some (fn [node-data]
-          (and (:start-time-millis node-data)
-               (not (:finish-time-millis node-data))))
+  (some graph-node/node-in-progress?
         (vals (get-in db [:invocations-data (invoke-data-key invoke-id) :graph :nodes] {}))))
+
+(defn- invocation-run-ended?
+  "A failed or cancelled run is final: its running nodes may never report back."
+  [db invoke-id]
+  (contains? #{:failure :cancelled}
+             (get-in db [:invocations-data (invoke-data-key invoke-id) :summary :status])))
 
 (defn should-schedule-poll?
   [db invoke-id page-is-complete]
   (or (not (invocation-graph-received? db invoke-id))
       (not page-is-complete)
-      (graph-has-in-progress-nodes? db invoke-id)))
+      (and (not (invocation-run-ended? db invoke-id))
+           (graph-has-in-progress-nodes? db invoke-id))))
 
 (defn- init-invocation-ui-from-storage [db invoke-id]
   (let [ui-path (inv-subs/invocation-ui-path invoke-id)

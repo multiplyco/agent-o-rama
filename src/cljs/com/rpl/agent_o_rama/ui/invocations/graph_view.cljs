@@ -845,8 +845,12 @@
                :data-id "final-result-section"}
          ($ :div {:className "flex justify-between items-center mb-2"}
             ($ :div {:className "text-sm font-medium text-gray-700"} "Final Result")
-            (if failure?
+            (cond
+              (= :cancelled (:status summary-data))
+              ($ :span {:className "px-2 py-1 bg-gray-200 text-gray-800 rounded-full text-xs font-medium"} "Cancelled")
+              failure?
               ($ :span {:className "px-2 py-1 bg-red-100 text-red-800 rounded-full text-xs font-medium"} "Failed")
+              :else
               ($ :span {:className "px-2 py-1 bg-green-100 text-green-800 rounded-full text-xs font-medium"} "Success")))
          ($ :div {:className "min-w-0"}
             ($ common/ExpandableContent {:content result-val

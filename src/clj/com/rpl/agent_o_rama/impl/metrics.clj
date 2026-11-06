@@ -2,15 +2,16 @@
   (:use [com.rpl.rama]
         [com.rpl.rama path])
   (:require
+   [com.rpl.agent-o-rama.impl.helpers :as h]
    [com.rpl.agent-o-rama.impl.types :as aor-types]
    [com.rpl.agent-o-rama.impl.stats :as stats]
    [rpl.schema.core :as s]))
 
 (defn run-success?
-  [{:keys [run-type result finish-time-millis] :as _data-map}]
+  [{:keys [run-type] :as data-map}]
   (if (= :agent run-type)
-    (not (:failure? result))
-    (some? finish-time-millis)))
+    (not (contains? #{:failure :cancelled} (h/run-status data-map)))
+    (= :completed (h/node-status data-map))))
 
 (def ALL-METRICS {})
 (defn all-metrics [] ALL-METRICS)

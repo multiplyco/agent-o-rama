@@ -40,8 +40,7 @@
                                                    selected (= (str selected-node-id) id)
                                                    has-changes (contains? changed-nodes node-id)
                                                    is-affected (and forking-mode? (contains? affected-nodes node-id))
-                                                   in-progress? (and (:start-time-millis data)
-                                                                     (not (:finish-time-millis data)))
+                                                   in-progress? (gn/node-in-progress? data)
                                                    is-stuck? (and in-progress? is-complete)
                                                    base-classes (cond
                                                                   is-affected

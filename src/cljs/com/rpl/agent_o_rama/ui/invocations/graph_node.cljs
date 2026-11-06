@@ -28,6 +28,13 @@
   (when-let [k (resolve-graph-key graph-data node-id)]
     (get graph-data k)))
 
+(defn node-in-progress?
+  "True for a started node that is running. The status is a string when node data
+  has been through clj->js, as in the React Flow view."
+  [node-data]
+  (boolean (and (:start-time-millis node-data)
+                (= :running (some-> (:status node-data) keyword)))))
+
 (defn normalize-raw-nodes-map
   "Coerce invoke-id map keys and emit targets to UUID for consistent graph traversal."
   [nodes-map]

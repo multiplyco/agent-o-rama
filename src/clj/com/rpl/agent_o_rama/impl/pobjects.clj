@@ -126,6 +126,7 @@
      :invoke-args [Object]
      :graph-version Long
      :result AgentResult
+     :status clojure.lang.Keyword ; :pending :success :failure :cancelled
      :exception-summaries [ExceptionSummary]
      :ack-val Long
      :start-time-millis Long
@@ -195,6 +196,7 @@
      :nested-ops          [NestedOpInfoImpl]
      :emits               [AgentNodeEmit]
      :result              AgentResult
+     :status              clojure.lang.Keyword ; :running :completed :failed :cancelled
      :start-time-millis   Long
      :finish-time-millis  Long
      :exceptions          [String] ; throwable strs

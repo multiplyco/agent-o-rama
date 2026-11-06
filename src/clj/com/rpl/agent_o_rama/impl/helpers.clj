@@ -395,6 +395,29 @@
       (assoc m "conductor.port" port)
       m)))
 
+(defn result->run-status
+  [{:keys [failure?]}]
+  (if failure? :failure :success))
+
+(defn run-status
+  "A run's status: :pending, :success, :failure or :cancelled. Roots written
+  before :status existed derive it from their result."
+  [{:keys [status result]}]
+  (cond
+    (some? status) status
+    (nil? result) :pending
+    :else (result->run-status result)))
+
+(defn node-status
+  "A node's status: :running, :completed, :failed or :cancelled. Nodes written
+  before :status existed derive it from their finish time and exceptions."
+  [{:keys [status finish-time-millis exceptions]}]
+  (cond
+    (some? status) status
+    (some? finish-time-millis) :completed
+    (seq exceptions) :failed
+    :else :running))
+
 (defn result->output
   [{:keys [failure? val] :as result}]
   (cond

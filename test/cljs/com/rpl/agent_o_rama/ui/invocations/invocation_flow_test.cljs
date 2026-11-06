@@ -4,6 +4,7 @@
    [cljs.test :refer-macros [deftest testing is]]
    [com.rpl.agent-o-rama.ui.dom]
    [com.rpl.agent-o-rama.ui.events :as events]
+   [com.rpl.agent-o-rama.ui.invocations.graph-node :as graph-node]
    [com.rpl.agent-o-rama.ui.invocations.subs :as inv-subs]
    [com.rpl.agent-o-rama.ui.re-frame :as aor-rf]
    [re-frame.core :as rf]
@@ -50,6 +51,16 @@
       (is (= worker-id selected-id))
       (is (= "worker" (:node (assoc node-data :node-id selected-id)))))))
 
+(deftest node-in-progress-test
+  (testing "the status is a string after clj->js, as in the React Flow view"
+    (is (graph-node/node-in-progress? {:start-time-millis 1 :status :running}))
+    (is (graph-node/node-in-progress? {:start-time-millis 1 :status "running"})))
+  (testing "a terminal status isn't in progress"
+    (doseq [status [:completed :failed :cancelled "completed" "failed" "cancelled"]]
+      (is (not (graph-node/node-in-progress? {:start-time-millis 1 :status status})))))
+  (testing "an aggregation waiting for input hasn't started"
+    (is (not (graph-node/node-in-progress? {:status :running})))))
+
 (deftest should-schedule-poll-test
   (testing "poll while agent not complete"
     (let [db (db-with-graph (sample-nodes) :is-complete false)]
@@ -65,9 +76,23 @@
 
   (testing "drain poll when agent complete but worker in progress"
     (let [nodes (assoc (sample-nodes) worker-id
-                       {:node "worker" :start-time-millis 200})
+                       {:node "worker" :start-time-millis 200 :status :running})
           db (db-with-graph nodes :is-complete true)]
       (is (events/should-schedule-poll? db invoke-id true))))
+
+  (testing "stop poll when a node failed without a finish time"
+    (let [nodes (assoc (sample-nodes) worker-id
+                       {:node "worker" :start-time-millis 200 :status :failed})
+          db (db-with-graph nodes :is-complete true)]
+      (is (not (events/should-schedule-poll? db invoke-id true)))))
+
+  (testing "stop poll when the run ended with a node still running"
+    (doseq [status [:failure :cancelled]]
+      (let [nodes (assoc (sample-nodes) worker-id
+                         {:node "worker" :start-time-millis 200 :status :running})
+            db (-> (db-with-graph nodes :is-complete true)
+                   (assoc-in [:invocations-data invoke-id :summary :status] status))]
+        (is (not (events/should-schedule-poll? db invoke-id true))))))
 
   (testing "stop poll when agent and all nodes finished"
     (let [db (db-with-graph (sample-nodes) :is-complete true)]

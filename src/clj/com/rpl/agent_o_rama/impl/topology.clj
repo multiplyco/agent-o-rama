@@ -126,6 +126,7 @@
       [(keypath *agent-id)
        (selected? :result nil?)
        (multi-path [:result (termval *result)]
+                   [:status (termval (h/result->run-status *result))]
                    [:finish-time-millis (termval *finish-time-millis)])]
       $$root)
      (local-transform> [:active-invokes (set-elem *agent-id) NONE>] $$stream-shared))
@@ -153,6 +154,7 @@
                         (termval (aor-types/->AgentResult
                                   "Agent completed without result"
                                   true))]
+                       [:status (termval :failure)]
                        [:finish-time-millis (termval *finish-time-millis)])]
           $$root)
          (local-transform> [:active-invokes (set-elem *agent-id) NONE>]
@@ -194,6 +196,7 @@
                :stats             stats/EMPTY-AGENT-STATS
                :metadata          *metadata
                :source            *source
+               :status            :pending
                :start-time-millis *current-time-millis})]
     $$root)
    (:> *invoke-id)))
@@ -294,6 +297,7 @@
      (multi-path
       [:result
        (termval (aor-types/->valid-AgentResult *message true))]
+      [:status (termval :failure)]
       [:finish-time-millis (termval *finish-time-millis)]
       ;; only called when a retry ends the run: the retry invalidated the
       ;; attempt whose requests these are
@@ -480,6 +484,7 @@
    (local-transform> [(keypath *invoke-id)
                       (multi-path
                        [:nested-ops NIL->VECTOR END (termval *nested-ops)]
+                       [:status (termval :failed)]
                        [:exceptions AFTER-ELEM (termval *throwable-str)])]
                      $$nodes)
    (|direct *agent-task-id)
@@ -590,6 +595,7 @@
                     *m
                     {:emits  *emits
                      :result *result
+                     :status :completed
                      :finish-time-millis *finish-time-millis})))
    (local-transform> [(keypath *invoke-id)
                       (multi-path
@@ -733,6 +739,7 @@
                :agg-state           *init-agg-state
                :agg-ack-val         (h/half-uuid *invoke-id)
                :agg-start-invoke-id *invoke-id
+               :status              :running
                :metadata            (get *execution-context :metadata)
                :source              (get *execution-context :source)
               })]
@@ -1107,7 +1114,7 @@
 (deframafn copy-unforked-agg-state
   [$$nodes *from-agg-invoke-id *agg-invoke-id]
   (local-select> [(keypath *from-agg-invoke-id)
-                  (submap [:nested-ops :emits :result :start-time-millis
+                  (submap [:nested-ops :emits :result :status :start-time-millis
                            :finish-time-millis :input :agg-state :agg-ack-val
                            :agg-finished?])]
                  $$nodes
@@ -1194,6 +1201,7 @@
                                     :metadata      (get *execution-context :metadata)
                                     :agg-invoke-id *agg-invoke-id
                                     :agg-start-res *agg-start-res
+                                    :status        :running
                                     :agg-start-invoke-id *invoke-id})]
                          $$nodes)
        (local-transform> [(keypath *invoke-id)

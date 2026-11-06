@@ -5,6 +5,7 @@
    [com.rpl.agent-o-rama :as aor]
    [com.rpl.agent-o-rama.impl.analytics :as ana]
    [com.rpl.agent-o-rama.impl.client :as iclient]
+   [com.rpl.agent-o-rama.impl.helpers :as h]
    [com.rpl.agent-o-rama.impl.pobjects :as po]
    [com.rpl.agent-o-rama.impl.stats :as stats]
    [com.rpl.agent-o-rama.impl.types :as aor-types]
@@ -61,7 +62,7 @@
       {:graph nil})))
 
 (defn trace-graph-complete?
-  "True when every reachable drawable node in the trace has :finish-time-millis."
+  "True when every reachable drawable node in the trace has a terminal status."
   [nodes root-invoke-id]
   (when (and (seq nodes) root-invoke-id (contains? nodes root-invoke-id))
     (loop [to-visit #{root-invoke-id}
@@ -78,7 +79,7 @@
                 (not node-name)
                 (recur remaining (conj visited current-id))
 
-                (not (:finish-time-millis node-data))
+                (= :running (h/node-status node-data))
                 false
 
                 :else
@@ -88,6 +89,18 @@
                                                 emitted-ids)]
                   (recur (into remaining drawable-children)
                          (conj visited current-id)))))))))))
+
+(defn invocation-complete?
+  "True when the run's page has nothing left to wait for. A successful run can
+  still have other branches running. A failed or cancelled run is final: its
+  attempt was invalidated, so its running nodes may never report back."
+  [summary nodes root-invoke-id]
+  (case (h/run-status summary)
+    :pending false
+    :success (boolean (and (seq nodes)
+                           root-invoke-id
+                           (trace-graph-complete? nodes root-invoke-id)))
+    true))
 
 (defn get-graph-page!!
   [system {:keys [module-id agent-name invoke-id]}]
@@ -104,7 +117,7 @@
             summary-info-raw (foreign-select-one
                               [(keypath agent-id)
                                (submap
-                                [:result :start-time-millis :finish-time-millis :graph-version
+                                [:result :status :start-time-millis :finish-time-millis :graph-version
                                  :retry-num :fork-of :exception-summaries :invoke-args :stats
                                  :feedback :metadata])]
                               root-pstate
@@ -115,7 +128,7 @@
                                     (sorted-set-range-to-end 100)]
                                    root-pstate
                                    {:pkey agent-task-id})}
-                          (->> summary-info-raw
+                          (->> (assoc summary-info-raw :status (h/run-status summary-info-raw))
                                (transform [:feedback :results ALL]
                                           (fn [feedback-result]
                                             (let [feedback-map (into {} feedback-result)
@@ -143,6 +156,10 @@
             cleaned-nodes (when-let [m (:invokes-map dynamic-trace)]
                             (->> m
                                  common/remove-implicit-nodes
+                                 ;; the UI reads :status, which old nodes lack
+                                 (transform
+                                  MAP-VALS
+                                  (fn [node] (assoc node :status (h/node-status node))))
                                  (transform
                                   [MAP-VALS :feedback :results ALL]
                                   (fn [feedback-result]
@@ -158,12 +175,7 @@
                                   [MAP-VALS :feedback :actions MAP-KEYS]
                                   name)))
 
-            agent-summary-complete? (boolean (or (:finish-time-millis summary-info)
-                                                 (:result summary-info)))
-            graph-complete? (and (seq cleaned-nodes)
-                                 root-invoke-id
-                                 (trace-graph-complete? cleaned-nodes root-invoke-id))
-            agent-is-complete? (and agent-summary-complete? graph-complete?)]
+            agent-is-complete? (invocation-complete? summary-info cleaned-nodes root-invoke-id)]
 
         {:is-complete agent-is-complete?
          :nodes cleaned-nodes

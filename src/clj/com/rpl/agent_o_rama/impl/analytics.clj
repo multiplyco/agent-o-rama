@@ -549,7 +549,8 @@
           (fn [[k data]]
             (or (and (contains? data :start-time-millis)
                      (> (:start-time-millis data) max-time))
-                (and (not (contains? data :finish-time-millis))
+                ;; a failed node isn't done: a retry may still complete it
+                (and (not (contains? #{:completed :cancelled} (h/node-status data)))
                      (not (contains? data :invoked-agg-invoke-id))
                      (or (retries/invoke-id-executing? node-exec k)
                          (and (contains? data :start-time-millis) ; not strictly necessary

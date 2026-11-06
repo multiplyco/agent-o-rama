@@ -347,10 +347,7 @@
 
 (defn invoke-status
   [m]
-  (let [r (:result m)]
-    (cond (nil? r) :pending
-          (:failure? r) :failure
-          :else :success)))
+  (h/run-status m))
 
 (defn invoke-latency-millis
   [m]
